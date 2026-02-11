@@ -38,41 +38,68 @@ export default function App() {
   // --- HANDLERS ---
   const handleSend = useCallback(async (txt) => {
     const q = txt || input;
-    if (!q.trim() || isLoading) return; // Prevent double send
-    
+    if (!q.trim() || isLoading) return; 
+
     let activeId = currentSessionId;
     if (!activeId) { activeId = Date.now(); setCurrentSessionId(activeId); }
 
-    // 1. Add User Message immediately
-    const newMsgs = [...messages, { role: "user", content: q }];
+    // 1. Add User Message locally
+    const userMsg = { role: "user", content: q };
+    const newMsgs = [...messages, userMsg];
     setMessages(newMsgs);
     setInput("");
-    setIsLoading(true); // ✨ Start Loading
+    setIsLoading(true); 
     
-    const historyContext = newMsgs.slice(-10).map(m => `${m.role === 'user' ? 'User' : 'Chinna'}: ${m.content}`);
+    // 2. Format History for Backend
+    // We take the last 10 messages and format them as "Role: Content"
+    const historyContext = newMsgs.slice(-10).map(m => 
+      `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`
+    );
 
     try {
+      // 3. Connect to Backend
+      // Ensure your Python backend is running on port 8000
       const res = await fetch("http://localhost:8000/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: q, history: historyContext }),
+        body: JSON.stringify({ 
+          question: q, 
+          history: historyContext 
+        }),
       });
+
+      if (!res.ok) throw new Error(`Server Error: ${res.status}`);
+
       const data = await res.json();
       
-      const finalMsgs = [...newMsgs, { role: "bot", content: data.answer }];
+      // 4. Update Chat with Bot Response
+      // We check if 'data.answer' exists, otherwise fallback to a default message
+      const botResponse = data.answer || "I received an empty response.";
+      
+      const finalMsgs = [...newMsgs, { role: "bot", content: botResponse }];
       setMessages(finalMsgs);
       
+      // 5. Update Session Storage
       setSessions(prev => {
         const idx = prev.findIndex(s => s.id === activeId);
         const newData = { id: activeId, title: q.slice(0,30), messages: finalMsgs };
         return idx > -1 ? prev.map((s, i) => i === idx ? newData : s) : [newData, ...prev];
       });
 
+      // (Optional) If you want to play the audio returned by the backend:
+      if (data.audio) {
+        const audio = new Audio(`data:audio/mp3;base64,${data.audio}`);
+        audio.play().catch(e => console.log("Audio play failed (interaction required)"));
+      }
+
     } catch (e) {
-      console.error("API Error:", e);
-      setMessages(prev => [...prev, { role: "bot", content: "⚠️ Error connecting to server." }]);
+      console.error("Connection Error:", e);
+      setMessages(prev => [...prev, { 
+        role: "bot", 
+        content: "⚠️ **Connection Error:** I cannot reach the backend server. \n\nPlease check:\n1. Is the Python script running? (`python main.py`)\n2. Is it running on port 8000?" 
+      }]);
     } finally {
-      setIsLoading(false); // ✨ Stop Loading
+      setIsLoading(false); 
     }
   }, [messages, input, currentSessionId, isLoading]);
 
