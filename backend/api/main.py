@@ -7,8 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 
-# --- CHANGED IMPORTS ---
-from langchain_community.document_loaders import PyMuPDFLoader # Best for Page Numbers
+# --- IMPORTS ---
+from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_openai import ChatOpenAI
 from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
@@ -35,7 +35,7 @@ text_llm = ChatOpenAI(
     base_url="http://127.0.0.1:11434/v1",
     api_key="EMPTY",
     model="llama3.1",
-    temperature=0,
+    temperature=0.1, # Slightly increased for fluency in long responses
     model_kwargs={"extra_body": {"num_ctx": 8192}} 
 )
 
@@ -43,8 +43,9 @@ ensemble_retriever = None
 
 # --- 2. AUDIO CLEANER ---
 def clean_for_audio(text: str) -> str:
-    # Remove the citation brackets like (Doc.pdf, Page 2) for audio
+    # Remove citations and markdown for TTS
     text = re.sub(r'\([^\)]+\.pdf, Page \d+\)', '', text)
+    text = re.sub(r'\*\*References:\*\*.*', '', text, flags=re.DOTALL) # Cut off references for audio
     text = re.sub(r'[*#`_~]', '', text)
     text = re.sub(r'[^\w\s,!.?\'"]', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
@@ -64,13 +65,13 @@ async def generate_audio(text: str):
 def handle_small_talk(query: str):
     q = query.lower().strip()
     if re.fullmatch(r'(hi|hello|hey|yo|good morning|good afternoon)', q):
-        return "Hello! I am your Corporate Assistant. How can I help you?"
-    if re.search(r'how.*(are you|about you|doing|is it going|about today|your day)', q):
+        return "Hello. I am your Corporate Knowledge Assistant. Please state your inquiry regarding company policy or documentation."
+    if re.search(r'how.*(are you|about you|doing|is it going)', q):
         if "process" not in q and "onbord" not in q:
-            return "I am fully operational. What would you like to know?"
+            return "Systems are fully operational. I am ready to process your query."
     return None
 
-# --- 4. DATA INGESTION (UPDATED FOR PAGES) ---
+# --- 4. DATA INGESTION ---
 def ingest_documents():
     global ensemble_retriever
     print(f"\n📂 Loading Documents: {SOURCE_DOCS_PATH}")
@@ -85,7 +86,6 @@ def ingest_documents():
     
     if vectorstore._collection.count() == 0:
         print("⚡ Indexing Documents with Page Numbers...")
-        
         all_chunks = []
         char_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
 
@@ -93,21 +93,15 @@ def ingest_documents():
             file_path = os.path.join(SOURCE_DOCS_PATH, filename)
             try:
                 print(f"   📖 Reading: {filename}")
-                
-                # CHANGED: Using PyMuPDFLoader to capture Page Numbers automatically
                 loader = PyMuPDFLoader(file_path)
                 raw_docs = loader.load()
                 
-                # Split the docs
                 chunks = char_splitter.split_documents(raw_docs)
-                
-                # Ensure metadata is clean
                 for chunk in chunks:
                     chunk.metadata["source"] = filename
-                    # PyMuPDF adds 'page' (int) to metadata automatically
-                    # We can try to extract a section header if it exists in the first line
+                    # Extract section or use default
                     first_line = chunk.page_content.split('\n')[0]
-                    section_name = first_line if len(first_line) < 50 else "General Section"
+                    section_name = first_line[:50] if len(first_line) > 3 else "General Section"
                     chunk.metadata["section"] = section_name
 
                 all_chunks.extend(chunks)
@@ -126,7 +120,6 @@ def ingest_documents():
         
         class UniversalRetriever:
             def invoke(self, query):
-                # We return actual Document objects here
                 return chroma.invoke(query) + bm25.invoke(query)
                 
         ensemble_retriever = UniversalRetriever()
@@ -134,81 +127,145 @@ def ingest_documents():
 
 ingest_documents()
 
-# --- 5. SMART QUERY CLEANER ---
+# --- 5. QUERY REFINER ---
 query_refiner_prompt = ChatPromptTemplate.from_template("""
-You are a Query Corrector.
-1. Fix spelling errors (e.g. "onbord" -> "onboarding").
-2. Clarify questions.
+You are a Query Standardization Engine.
+1. Correct spelling (e.g., "polcy" -> "policy").
+2. Expand acronyms if standard (e.g., "HR" -> "Human Resources").
+3. Output ONLY the refined query string.
 User Input: {question}
-Corrected Input:
+Refined Output:
 """)
 query_refiner = query_refiner_prompt | text_llm | StrOutputParser()
 
-# --- 6. CHAT LOGIC ---
+# --- 6. CHAT LOGIC WITH "MEGA-PROMPT" ---
 class ChatRequest(BaseModel):
     question: str
     history: Optional[List[str]] = []
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
+    # Check small talk
     small_talk = handle_small_talk(req.question)
     if small_talk:
         audio = await generate_audio(small_talk)
         return {"answer": small_talk, "audio": audio}
 
-    if not ensemble_retriever: return {"answer": "Please upload a document."}
+    if not ensemble_retriever: 
+        return {"answer": "System initialization incomplete. Please upload source documentation."}
 
-    # 1. Refine
+    # 1. Refine Query
     clean_question = await query_refiner.ainvoke({"question": req.question})
     print(f"🔍 Refined Search: '{clean_question}'")
 
-    # 2. Search & Format Context
+    # 2. Retrieve & Metadata Injection
     docs = ensemble_retriever.invoke(clean_question)
-    
-    # CHANGED: Inject Metadata into the Context String for the LLM
     formatted_context_list = []
+    
     for d in docs:
-        # Check if it's a Chroma Document or BM25 String
         if hasattr(d, 'metadata'):
-            source = d.metadata.get('source', 'Unknown Doc')
-            page = d.metadata.get('page', 0) + 1 # PyMuPDF is 0-indexed, so we add 1
+            source = d.metadata.get('source', 'Unknown Document')
+            page = d.metadata.get('page', 0) + 1
             section = d.metadata.get('section', 'General')
-            content = d.page_content
-            # We wrap the content with its specific metadata tag
-            formatted_context_list.append(f"Content: {content}\n[Metadata: Document='{source}', Page={page}, Section='{section}']")
+            content = d.page_content.replace("\n", " ")
+            # Strict XML-style wrapping for the LLM to parse easily
+            formatted_context_list.append(
+                f"<doc><meta source='{source}' page='{page}' section='{section}'/>"
+                f"<content>{content}</content></doc>"
+            )
         else:
-            formatted_context_list.append(d) # Fallback for string-only retrievers
+            formatted_context_list.append(f"<doc><content>{d}</content></doc>")
 
-    context_text = "\n---\n".join(formatted_context_list)
-    history_text = "\n".join(req.history) if req.history else "No previous chat."
+    context_text = "\n".join(formatted_context_list)
+    history_text = "\n".join(req.history) if req.history else "None."
 
-    # 3. Final Prompt (Clean Westminster Style)
-    prompt = ChatPromptTemplate.from_template("""
-    You are a Corporate Assistant.
+    # 3. THE "MEGA-PROMPT" (approx. 1000 words of instruction logic)
+    # We use a raw string literal to allow for extensive instructions.
     
-    ### RULES:
-    1. **Direct Answers Only:** Answer the user's question directly as if you are stating facts. 
-       - ❌ DO NOT say: "According to the document...", "The document titled X says...", or "As outlined in..."
-       - ✅ DO say: "The Internal Code of Business Conduct addresses conflicts of interest..."
-       
-    2. **Content First:** Do NOT include any inline citations or brackets in the main text.
+    SYSTEM_INSTRUCTIONS = """
+    You are the **Senior Corporate Compliance & Information Officer**. 
+    Your mandate is to provide strictly factual, legally sound, and document-backed responses based *solely* on the provided context.
     
-    3. **Reference List (Westminster Style):**
-       At the very bottom, leave two blank lines and add a "References" section.
-       Format:
-       **References:**
-       * [Author/Company]. ([Year]). *[Document Name]*. [Page Number], [Section Name].
-       
-       (Use "CDB PLC" as author and "n.d." if date is unknown).
+    ================================================================================
+    **SECTION 1: CORE OPERATIONAL DIRECTIVES**
+    ================================================================================
+    1. **Absolute Truth Protocol:** You must derive 100% of your answer from the `<doc>` tags provided in the context. If the answer is not explicitly stated in the text, you must state: "The provided documentation does not contain information regarding [specific topic]." Do not halluncinate, do not guess, and do not use outside knowledge.
     
-    ### DOCUMENT CONTEXT:
-    {c}
+    2. **Tone & Persona:** - Your tone is professional, executive, and objective. 
+       - Avoid conversational filler (e.g., "Sure!", "I think", "It seems"). 
+       - Speak with authority. Do not say "According to the document..."; instead, state the fact directly (e.g., "Employees must submit Form A by 5 PM").
     
-    ### USER QUESTION: 
-    {q}
+    3. **Structure:**
+       - **Summary:** Begin with a direct, 1-2 sentence answer to the core question.
+       - **Details:** Use bullet points for lists, conditions, or steps.
+       - **References:** Always conclude with a citations section.
     
-    ### ANSWER:
-    """)
+    ================================================================================
+    **SECTION 2: FORMATTING STANDARDS**
+    ================================================================================
+    - **Markdown:** Use **bold** for key terms or deadlines. Use `> blockquotes` for verbatim policy text.
+    - **Lists:** Use unordered lists (-) for non-sequential items and ordered lists (1.) for procedures.
+    - **Clarity:** Break long paragraphs into digestible chunks.
+    
+    ================================================================================
+    **SECTION 3: CITATION PROTOCOL (STRICT WESTMINSTER STYLE)**
+    ================================================================================
+    You are required to append a reference list at the very bottom of your response. 
+    You must extract the `source`, `page`, and `section` attributes from the `<meta>` tags in the context.
+    
+    **Rules for Main Text:**
+    - Do NOT put citations (e.g., [Doc1, p.2]) inside the sentences. Keep the reading flow smooth.
+    
+    **Rules for Reference Section:**
+    - Leave two blank lines after the answer.
+    - Title the section strictly as "**References:**".
+    - Format every used source exactly as follows:
+      `* [Author/Organization]. (n.d.). *[Document Filename]*. [Page Number], [Section Name].`
+    - If the author is unknown, use "CDB PLC" or "Corporate Policy" as the default author.
+    - Deduplicate references. If multiple facts come from the same page of the same doc, list it once.
+    
+    ================================================================================
+    **SECTION 4: NEGATIVE CONSTRAINTS (DO NOT DO)**
+    ================================================================================
+    - **NO** Apologies: Never say "I'm sorry, but...". Just state the limitation.
+    - **NO** Meta-Commentary: Do not say "I found this in the text."
+    - **NO** Preachiness: Do not add moralizing language (e.g., "It is important to follows rules").
+    - **NO** HTML/JSON output: Output pure Markdown text only.
+    
+    ================================================================================
+    **SECTION 5: EDGE CASE HANDLING**
+    ================================================================================
+    - **Conflict:** If two documents contradict each other, explicitly note the discrepancy: "Document A states X, whereas Document B states Y."
+    - **Ambiguity:** If the user asks a vague question (e.g., "Tell me about the policy"), summarize the most relevant section found in the context.
+    - **Irrelevance:** If the context provided contains nothing relevant to the user query, return *only* this exact phrase: "Information unavailable in current repository."
+    
+    ================================================================================
+    **SECTION 6: FINAL OUTPUT CONSTRUCTION**
+    ================================================================================
+    Step 1: Analyze the User Question.
+    Step 2: Scan `DOCUMENT CONTEXT` for keywords.
+    Step 3: Synthesize facts into a coherent narrative.
+    Step 4: Extract metadata for the footer.
+    Step 5: Render final Markdown.
+    
+    """
+    
+    prompt = ChatPromptTemplate.from_template(
+        SYSTEM_INSTRUCTIONS + 
+        """
+        
+        ### DOCUMENT CONTEXT:
+        {c}
+        
+        ### CONVERSATION HISTORY:
+        {h}
+        
+        ### USER QUESTION: 
+        {q}
+        
+        ### YOUR RESPONSE:
+        """
+    )
     
     chain = prompt | text_llm | StrOutputParser()
     
